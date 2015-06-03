@@ -20,9 +20,9 @@ type AppStatus struct {
 }
 
 type ScaleoverCmd struct {
-	app1     AppStatus
-	app2     AppStatus
-	maxcount int
+	app1 AppStatus
+	app2 AppStatus
+	cc   CloudController
 }
 
 //GetMetadata returns metatada
@@ -31,7 +31,7 @@ func (cmd *ScaleoverCmd) GetMetadata() plugin.PluginMetadata {
 		Name: "scaleover",
 		Version: plugin.VersionType{
 			Major: 0,
-			Minor: 1,
+			Minor: 2,
 			Build: 0,
 		},
 		Commands: []plugin.Command{
@@ -61,7 +61,6 @@ func (cmd *ScaleoverCmd) parseTime(duration string) (time.Duration, error) {
 	rolloverTime := time.Duration(0)
 	var err error
 	rolloverTime, err = time.ParseDuration(duration)
-
 	if err != nil {
 		return rolloverTime, err
 	}
@@ -73,6 +72,11 @@ func (cmd *ScaleoverCmd) parseTime(duration string) (time.Duration, error) {
 }
 
 func (cmd *ScaleoverCmd) Run(cliConnection plugin.CliConnection, args []string) {
+
+	defer handlePanics()
+
+	cmd.cc = NewCloudController()
+
 
 	err := cmd.usage(args)
 	if nil != err {
@@ -124,24 +128,15 @@ func (cmd *ScaleoverCmd) getAppStatus(cliConnection plugin.CliConnection, name s
 		state:          "unknown",
 	}
 
-	output, _ := cliConnection.CliCommandWithoutTerminalOutput("app", name)
-
-	for idx, v := range output {
-		v = strings.TrimSpace(v)
-		if strings.HasPrefix(v, "FAILED") {
-			e := output[idx+1]
-			return status, errors.New(e)
-		}
-		if strings.HasPrefix(v, "requested state: ") {
-			status.state = strings.TrimPrefix(v, "requested state: ")
-		}
-		if strings.HasPrefix(v, "instances: ") {
-			instances := strings.TrimPrefix(v, "instances: ")
-			split := strings.Split(instances, "/")
-			status.countRunning, _ = strconv.Atoi(split[0])
-			status.countRequested, _ = strconv.Atoi(split[1])
-		}
+	app, err := cmd.cc.GetApplication(name)
+	if (err != nil) {
+		return status, err
 	}
+
+	status.state = app.State
+	status.countRunning = app.RunningInstances
+	status.countRequested = app.InstanceCount
+
 	// Compensate for some CF weirdness that leaves the requested instances non-zero
 	// even though the app is stopped
 	if "stopped" == status.state {

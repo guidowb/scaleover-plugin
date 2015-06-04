@@ -5,13 +5,13 @@ import (
 	"time"
 
 	"github.com/cloudfoundry/cli/cf/api/applications"
+	"github.com/cloudfoundry/cli/cf/api/authentication"
 	"github.com/cloudfoundry/cli/cf/configuration/core_config"
 	"github.com/cloudfoundry/cli/cf/configuration/config_helpers"
 	"github.com/cloudfoundry/cli/cf/i18n"
 	"github.com/cloudfoundry/cli/cf/i18n/detection"
 	"github.com/cloudfoundry/cli/cf/models"
 	"github.com/cloudfoundry/cli/cf/net"
-	"github.com/cloudfoundry/cli/cf/terminal"
 	"github.com/cloudfoundry/cli/cf/trace"
 )
 
@@ -30,6 +30,7 @@ func NewCloudController() (cc CloudController) {
 	}
 	cc.config = core_config.NewRepositoryFromFilepath(config_helpers.DefaultFilePath(), errorHandler)
 	cc.gateway = net.NewCloudControllerGateway(cc.config, time.Now, nil)
+	cc.gateway.SetTokenRefresher(authentication.NewUAAAuthenticationRepository(cc.gateway, cc.config))
 	cc.appRepo = applications.NewCloudControllerApplicationRepository(cc.config, cc.gateway)
 
 	// I18N usage in the library will cause the app to crash unless this is initialized

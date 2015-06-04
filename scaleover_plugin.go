@@ -4,25 +4,20 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/andrew-d/go-termutil"
 	"github.com/cloudfoundry/cli/plugin"
+	"github.com/cloudfoundry/cli/cf/models"
+	"github.com/guidowb/cf-go-client/panic"
+	"github.com/guidowb/cf-go-client/api"
 )
 
-type AppStatus struct {
-	name           string
-	countRunning   int
-	countRequested int
-	state          string
-}
-
 type ScaleoverCmd struct {
-	app1 AppStatus
-	app2 AppStatus
-	cc   CloudController
+	app1 models.Application
+	app2 models.Application
+	cc   api.CloudController
 }
 
 //GetMetadata returns metatada
@@ -80,44 +75,37 @@ func (cmd *ScaleoverCmd) Run(cliConnection plugin.CliConnection, args []string) 
 
 func (cmd *ScaleoverCmd) ScaleoverCommand(cliConnection plugin.CliConnection, args []string) {
 
-	defer handlePanics()
+	defer panic.HandlePanics()
 
-	cmd.cc = NewCloudController()
+	cmd.cc = api.NewCloudController()
 
 	err := cmd.usage(args)
-	if nil != err {
-		fmt.Println(err)
-		os.Exit(1)
-	}
+	checkError(err)
 
 	rolloverTime, err := cmd.parseTime(args[3])
-	if nil != err {
-		fmt.Println(err)
-		os.Exit(1)
-	}
+	checkError(err)
 
-	// The getAppStatus calls will exit with an error if the named apps don't exist
-	cmd.app1, err = cmd.getAppStatus(cliConnection, args[1])
-	if nil != err {
-		fmt.Println(err)
-		os.Exit(1)
-	}
+	cmd.app1, err = cmd.getAppStatus(args[1])
+	checkError(err)
 
-	cmd.app2, err = cmd.getAppStatus(cliConnection, args[2])
-	if nil != err {
-		fmt.Println(err)
-		os.Exit(1)
+	cmd.app2, err = cmd.getAppStatus(args[2])
+	checkError(err)
+
+	count := cmd.app1.InstanceCount
+	if (count == 0) {
+		fmt.Println("There are no instances of the source app to scale over")
+		os.Exit(0)
 	}
+	sleepInterval := time.Duration(rolloverTime.Nanoseconds() / int64(count))
 
 	cmd.showStatus()
 
-	count := cmd.app1.countRequested
-	sleepInterval := time.Duration(rolloverTime.Nanoseconds() / int64(count))
-
 	for count > 0 {
 		count--
-		cmd.app2.scaleUp(cliConnection)
-		cmd.app1.scaleDown(cliConnection)
+		err = cmd.scaleUp(&cmd.app2)
+		checkError(err)
+		err = cmd.scaleDown(&cmd.app1)
+		checkError(err)
 		cmd.showStatus()
 		if count > 0 {
 			time.Sleep(sleepInterval)
@@ -126,70 +114,74 @@ func (cmd *ScaleoverCmd) ScaleoverCommand(cliConnection plugin.CliConnection, ar
 	fmt.Println()
 }
 
-func (cmd *ScaleoverCmd) getAppStatus(cliConnection plugin.CliConnection, name string) (AppStatus, error) {
-	status := AppStatus{
-		name:           name,
-		countRunning:   0,
-		countRequested: 0,
-		state:          "unknown",
+func (cmd *ScaleoverCmd) getAppStatus(name string) (app models.Application, err error) {
+	app, err = cmd.cc.GetApplication(name)
+	if nil != err {
+		return
 	}
 
-	app, err := cmd.cc.GetApplication(name)
-	if (err != nil) {
-		return status, err
-	}
-
-	status.state = app.State
-	status.countRunning = app.RunningInstances
-	status.countRequested = app.InstanceCount
-
-	// Compensate for some CF weirdness that leaves the requested instances non-zero
+	// Compensate for some CF weirdness that leaves the instance count non-zero
 	// even though the app is stopped
-	if "stopped" == status.state {
-		status.countRequested = 0
+	if "stopped" == app.State {
+		app.InstanceCount = 0
 	}
-	return status, nil
+	return
 }
 
-func (app *AppStatus) scaleUp(cliConnection plugin.CliConnection) {
+func (cmd *ScaleoverCmd) scaleUp(app *models.Application) (err error) {
+	// First set the desired instance count (even if the app is not already started)
+	app.InstanceCount++
+	err = cmd.cc.UpdateApplication(app, models.AppParams{InstanceCount: &app.InstanceCount})
+	if nil != err {
+		return
+	}
 	// If not already started, start it
-	if app.state != "started" {
-		cliConnection.CliCommandWithoutTerminalOutput("start", app.name)
-		app.state = "started"
+	if app.State != "started" {
+		err = cmd.cc.StartApplication(app)
 	}
-	app.countRequested++
-	cliConnection.CliCommandWithoutTerminalOutput("scale", "-i", strconv.Itoa(app.countRequested), app.name)
+	return
 }
 
-func (app *AppStatus) scaleDown(cliConnection plugin.CliConnection) {
-	app.countRequested--
+func (cmd *ScaleoverCmd) scaleDown(app *models.Application) (err error) {
+	app.InstanceCount--
 	// If going to zero, stop the app
-	if app.countRequested == 0 {
-		cliConnection.CliCommandWithoutTerminalOutput("stop", app.name)
-		app.state = "stopped"
+	if app.InstanceCount == 0 {
+		err = cmd.cc.StopApplication(app)
+		if err != nil {
+			return
+		}
+		app.InstanceCount = 0
 	} else {
-		cliConnection.CliCommandWithoutTerminalOutput("scale", "-i", strconv.Itoa(app.countRequested), app.name)
+		err = cmd.cc.UpdateApplication(app, models.AppParams{InstanceCount: &app.InstanceCount})
 	}
+	return
 }
 
 func (cmd *ScaleoverCmd) showStatus() {
 	if termutil.Isatty(os.Stdout.Fd()) {
 		fmt.Printf("%s (%s) %s %s %s (%s) \r",
-			cmd.app1.name,
-			cmd.app1.state,
-			strings.Repeat("<", cmd.app1.countRequested),
-			strings.Repeat(">", cmd.app2.countRequested),
-			cmd.app2.name,
-			cmd.app2.state,
+			cmd.app1.Name,
+			cmd.app1.State,
+			strings.Repeat("<", cmd.app1.InstanceCount),
+			strings.Repeat(">", cmd.app2.InstanceCount),
+			cmd.app2.Name,
+			cmd.app2.State,
 		)
 	} else {
 		fmt.Printf("%s (%s) %d instances, %s (%s) %d instances\n",
-			cmd.app1.name,
-			cmd.app1.state,
-			cmd.app1.countRequested,
-			cmd.app2.name,
-			cmd.app2.state,
-			cmd.app2.countRequested,
+			cmd.app1.Name,
+			cmd.app1.State,
+			cmd.app1.InstanceCount,
+			cmd.app2.Name,
+			cmd.app2.State,
+			cmd.app2.InstanceCount,
 		)
+	}
+}
+
+func checkError(err error) {
+	if nil != err {
+		fmt.Println(err)
+		os.Exit(1)
 	}
 }
